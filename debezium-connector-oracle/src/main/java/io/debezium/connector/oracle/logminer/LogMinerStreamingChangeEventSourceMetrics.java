@@ -424,6 +424,7 @@ public class LogMinerStreamingChangeEventSourceMetrics
      */
     public void setBatchSize(int batchSize) {
         this.batchSize.set(batchSize);
+        LOGGER.info("[LogMinerMetrics] Batch size set to {}", batchSize);
     }
 
     /**

@@ -83,6 +83,7 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
 
     @Override
     public void processLCR(LCR lcr) throws StreamsException {
+        long start = System.currentTimeMillis();
         LOGGER.trace("Received LCR {}", lcr);
         try {
             // First set watermark to flush messages seen
@@ -128,7 +129,12 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
         }
         // XStream's receiveLCRCallback() doesn't reliably propagate exceptions, so we do that ourselves here
         catch (Exception e) {
+            LOGGER.info("Error: {}", e.getMessage());
             errorHandler.setProducerThrowable(e);
+        } finally {
+            long end = System.currentTimeMillis();
+            long duration = end - start;
+            LOGGER.info("[LcrEventHandler] LCR processed in {} ms", duration);
         }
     }
 

@@ -110,18 +110,46 @@ public class XstreamStreamingChangeEventSource implements StreamingChangeEventSo
 
         try (OracleConnection xsConnection = connectAndAttachWithRetries(jdbcConnection.config(), getStartPosition(offsetContext))) {
             try {
+                int loopCount = 0;
+                long totalDuration = 0;
+                long maxDuration = 0;
+                final long SLOW_OP_THRESHOLD_MS = 500; // Warn if any op takes longer than this
                 // 2. receive events while running
                 while (context.isRunning()) {
-                    LOGGER.trace("Receiving LCR");
+                    long receiveStart = System.currentTimeMillis();
+                    LOGGER.info("[XStream] About to receive LCR (loop {}), offset: {}", loopCount, effectiveOffset != null ? effectiveOffset.getScn() : null);
                     xsOut.receiveLCRCallback(eventHandler, XStreamOut.DEFAULT_MODE);
+                    long receiveEnd = System.currentTimeMillis();
+                    long duration = receiveEnd - receiveStart;
+                    totalDuration += duration;
+                    if (duration > maxDuration) {
+                        maxDuration = duration;
+                    }
+                    LOGGER.info("[XStream] Received LCR (loop {}), duration: {} ms, offset: {}", loopCount, duration, effectiveOffset != null ? effectiveOffset.getScn() : null);
+                    if (duration > SLOW_OP_THRESHOLD_MS) {
+                        LOGGER.warn("[XStream] Slow LCR receive/handle (loop {}): {} ms", loopCount, duration);
+                    }
+
+                    long dispatchStart = System.currentTimeMillis();
                     dispatcher.dispatchHeartbeatEvent(partition, offsetContext);
+                    long dispatchEnd = System.currentTimeMillis();
+                    long dispatchDuration = dispatchEnd - dispatchStart;
+                    if (dispatchDuration > SLOW_OP_THRESHOLD_MS) {
+                        LOGGER.warn("[XStream] Slow heartbeat dispatch (loop {}): {} ms", loopCount, dispatchDuration);
+                    }
+
+                    if (loopCount > 0 && loopCount % 100 == 0) {
+                        long avgDuration = totalDuration / loopCount;
+                        LOGGER.info("[XStream] Stats after {} loops: avg LCR receive/handle {} ms, max {} ms", loopCount, avgDuration, maxDuration);
+                    }
 
                     if (context.isPaused()) {
-                        LOGGER.info("Streaming will now pause");
+                        LOGGER.info("[XStream] Streaming will now pause (loop {})", loopCount);
                         context.streamingPaused();
                         context.waitSnapshotCompletion();
-                        LOGGER.info("Streaming resumed");
+                        LOGGER.info("[XStream] Streaming resumed (loop {})", loopCount);
                     }
+                    loopCount++;
                 }
             }
             finally {
@@ -130,9 +158,11 @@ public class XstreamStreamingChangeEventSource implements StreamingChangeEventSo
                     try {
                         XStreamOut xsOut = this.xsOut;
                         this.xsOut = null;
+                        LOGGER.info("Attempting to detach from XStream outbound server " + xStreamServerName);
                         xsOut.detach(XStreamOut.DEFAULT_MODE);
+                        LOGGER.info("Successfully detached from XStream outbound server " + xStreamServerName);
                     }
-                    catch (StreamsException e) {
+                    catch (Exception e) {
                         LOGGER.error("Couldn't detach from XStream outbound server " + xStreamServerName, e);
                     }
                 }
