@@ -110,46 +110,27 @@ public class XstreamStreamingChangeEventSource implements StreamingChangeEventSo
 
         try (OracleConnection xsConnection = connectAndAttachWithRetries(jdbcConnection.config(), getStartPosition(offsetContext))) {
             try {
-                int loopCount = 0;
-                long totalDuration = 0;
-                long maxDuration = 0;
-                final long SLOW_OP_THRESHOLD_MS = 500; // Warn if any op takes longer than this
+                int lcrCount = 0;
+                Scn lastScn = effectiveOffset != null ? effectiveOffset.getScn() : null;
                 // 2. receive events while running
                 while (context.isRunning()) {
                     long receiveStart = System.currentTimeMillis();
-                    LOGGER.info("[XStream] About to receive LCR (loop {}), offset: {}", loopCount, effectiveOffset != null ? effectiveOffset.getScn() : null);
                     xsOut.receiveLCRCallback(eventHandler, XStreamOut.DEFAULT_MODE);
-                    long receiveEnd = System.currentTimeMillis();
-                    long duration = receiveEnd - receiveStart;
-                    totalDuration += duration;
-                    if (duration > maxDuration) {
-                        maxDuration = duration;
-                    }
-                    LOGGER.info("[XStream] Received LCR (loop {}), duration: {} ms, offset: {}", loopCount, duration, effectiveOffset != null ? effectiveOffset.getScn() : null);
-                    if (duration > SLOW_OP_THRESHOLD_MS) {
-                        LOGGER.warn("[XStream] Slow LCR receive/handle (loop {}): {} ms", loopCount, duration);
-                    }
-
-                    long dispatchStart = System.currentTimeMillis();
-                    dispatcher.dispatchHeartbeatEvent(partition, offsetContext);
-                    long dispatchEnd = System.currentTimeMillis();
-                    long dispatchDuration = dispatchEnd - dispatchStart;
-                    if (dispatchDuration > SLOW_OP_THRESHOLD_MS) {
-                        LOGGER.warn("[XStream] Slow heartbeat dispatch (loop {}): {} ms", loopCount, dispatchDuration);
-                    }
-
-                    if (loopCount > 0 && loopCount % 100 == 0) {
-                        long avgDuration = totalDuration / loopCount;
-                        LOGGER.info("[XStream] Stats after {} loops: avg LCR receive/handle {} ms, max {} ms", loopCount, avgDuration, maxDuration);
-                    }
-
                     if (context.isPaused()) {
-                        LOGGER.info("[XStream] Streaming will now pause (loop {})", loopCount);
+                        LOGGER.info("[XStream] Streaming will now pause (LCR count {})", lcrCount);
                         context.streamingPaused();
                         context.waitSnapshotCompletion();
-                        LOGGER.info("[XStream] Streaming resumed (loop {})", loopCount);
+                        LOGGER.info("[XStream] Streaming resumed (LCR count {})", lcrCount);
                     }
-                    loopCount++;
+                    Scn currentScn = effectiveOffset != null ? effectiveOffset.getScn() : null;
+                    if (currentScn != null && (!currentScn.equals(lastScn))) {
+                        lcrCount = 0;
+                        lastScn = currentScn;
+                    }
+                    lcrCount++;
+                    long receiveEnd = System.currentTimeMillis();
+                    long duration = receiveEnd - receiveStart;
+                    LOGGER.info("[XStream] Received LCR (count {}), duration: {} ms, offset: {}", lcrCount, duration, effectiveOffset != null ? effectiveOffset.getScn() : null);
                 }
             }
             finally {

@@ -345,6 +345,7 @@ public class EventDispatcher<P extends Partition, T extends DataCollectionId> im
             return handled;
         }
         catch (Exception e) {
+            LOGGER.info("Exception while dispatching data change event", e);
             handleEventProcessingFailure(e, changeRecordEmitter.getOffset());
             return false;
         } finally {

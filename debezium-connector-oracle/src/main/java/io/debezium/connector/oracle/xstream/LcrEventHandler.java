@@ -85,6 +85,7 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
     public void processLCR(LCR lcr) throws StreamsException {
         long start = System.currentTimeMillis();
         LOGGER.trace("Received LCR {}", lcr);
+        LOGGER.trace("Processing LCR from SCN {}", offsetContext.getScn());
         try {
             // First set watermark to flush messages seen
             setWatermark();
@@ -95,14 +96,12 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
             // After a restart it may happen we get the event with the last processed LCR again
             LcrPosition offsetLcrPosition = LcrPosition.valueOf(offsetContext.getLcrPosition());
             if (lcrPosition.compareTo(offsetLcrPosition) <= 0) {
-                if (LOGGER.isDebugEnabled()) {
-                    final LcrPosition recPosition = offsetLcrPosition;
-                    LOGGER.debug("Ignoring change event with already processed SCN/LCR Position {}/{}, last recorded {}/{}",
-                            lcrPosition,
-                            lcrPosition.getScn(),
-                            recPosition != null ? recPosition : "none",
-                            recPosition != null ? recPosition.getScn() : "none");
-                }
+                final LcrPosition recPosition = offsetLcrPosition;
+                LOGGER.info("Ignoring change event with already processed SCN/LCR Position {}/{}, last recorded {}/{}",
+                        lcrPosition,
+                        lcrPosition.getScn(),
+                        recPosition != null ? recPosition : "none",
+                        recPosition != null ? recPosition.getScn() : "none");
                 return;
             }
 
@@ -129,7 +128,7 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
         }
         // XStream's receiveLCRCallback() doesn't reliably propagate exceptions, so we do that ourselves here
         catch (Exception e) {
-            LOGGER.info("Error: {}", e.getMessage());
+            LOGGER.info("Error during processLCR: {}", e.getMessage());
             errorHandler.setProducerThrowable(e);
         } finally {
             long end = System.currentTimeMillis();
