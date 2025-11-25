@@ -111,11 +111,24 @@ public class XstreamStreamingChangeEventSource implements StreamingChangeEventSo
         try (OracleConnection xsConnection = connectAndAttachWithRetries(jdbcConnection.config(), getStartPosition(offsetContext))) {
             try {
                 int lcrCount = 0;
+                int totalLcrCount = 0;
                 Scn lastScn = effectiveOffset != null ? effectiveOffset.getScn() : null;
+                long loopIterations = 0;
+
+                LOGGER.info("[XStream-Init] Starting event loop - initial SCN: {}, serverName: {}", lastScn, xStreamServerName);
+
                 // 2. receive events while running
                 while (context.isRunning()) {
+                    loopIterations++;
                     long receiveStart = System.currentTimeMillis();
+
+                    LOGGER.info("[XStream-Perf] BEFORE receiveLCRCallback (iteration: {}, totalLcr: {}, scnCount: {}, currentScn: {})",
+                            loopIterations, totalLcrCount, lcrCount, effectiveOffset != null ? effectiveOffset.getScn() : null);
                     xsOut.receiveLCRCallback(eventHandler, XStreamOut.DEFAULT_MODE);
+
+                    long receiveEnd = System.currentTimeMillis();
+                    long receiveDuration = receiveEnd - receiveStart;
+                    LOGGER.info("[XStream-Perf] AFTER receiveLCRCallback - callback took {} ms", receiveDuration);
                     if (context.isPaused()) {
                         LOGGER.info("[XStream] Streaming will now pause (LCR count {})", lcrCount);
                         context.streamingPaused();
@@ -124,14 +137,23 @@ public class XstreamStreamingChangeEventSource implements StreamingChangeEventSo
                     }
                     Scn currentScn = effectiveOffset != null ? effectiveOffset.getScn() : null;
                     if (currentScn != null && (!currentScn.equals(lastScn))) {
+                        LOGGER.info("[XStream-Perf] *** SCN TRANSITION: {} -> {} | LCRs for prev SCN: {} ***",
+                                lastScn, currentScn, lcrCount);
                         lcrCount = 0;
                         lastScn = currentScn;
                     }
                     lcrCount++;
-                    long receiveEnd = System.currentTimeMillis();
-                    long duration = receiveEnd - receiveStart;
-                    LOGGER.info("[XStream] Received LCR (count {}), duration: {} ms, offset: {}", lcrCount, duration, effectiveOffset != null ? effectiveOffset.getScn() : null);
+                    totalLcrCount++;
+
+                    LOGGER.info("[XStream] Received LCR (scnCount: {}, total: {}, iteration: {}), receiveLCRCallback duration: {} ms, currentScn: {}",
+                            lcrCount, totalLcrCount, loopIterations, receiveDuration, currentScn);
+
+                    if (receiveDuration > 1000) {
+                        LOGGER.info("[XStream-Perf] SLOW CALLBACK: receiveLCRCallback took {} ms - this is unusually slow", receiveDuration);
+                    }
                 }
+                LOGGER.info("[XStream-Shutdown] Event loop stopped - total LCRs processed: {}, total iterations: {}",
+                        totalLcrCount, loopIterations);
             }
             finally {
                 // 3. disconnect

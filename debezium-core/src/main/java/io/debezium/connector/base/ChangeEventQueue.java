@@ -8,11 +8,7 @@ package io.debezium.connector.base;
 import static io.debezium.util.Loggings.maybeRedactSensitiveData;
 
 import java.time.Duration;
-import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Queue;
+import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Condition;
@@ -193,6 +189,7 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
             throw new InterruptedException();
         }
 
+        long startTime = System.currentTimeMillis();
         if (buffering) {
             record = bufferedEvent.getAndSet(record);
             if (record == null) {
@@ -202,6 +199,8 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
         }
 
         doEnqueue(record);
+        long duration = System.currentTimeMillis() - startTime;
+        LOGGER.info("PERF: Enqueued record in {}ms", duration);
     }
 
     /**
@@ -238,14 +237,20 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
             LOGGER.trace("Enqueuing source record '{}'", maybeRedactSensitiveData(record));
         }
 
+        String randomUUIDString = UUID.randomUUID().toString();
         try {
             this.lock.lock();
 
+            LOGGER.info("[{}] Current queue size: {}, max queue size: {}, current queue size in bytes: {}, max queue size in bytes: {}", randomUUIDString, queue.size(), maxQueueSize, currentQueueSizeInBytes, maxQueueSizeInBytes);
             while (queue.size() >= maxQueueSize || (maxQueueSizeInBytes > 0 && currentQueueSizeInBytes >= maxQueueSizeInBytes)) {
                 // signal poll() to drain queue
+                LOGGER.info("[{}] Queue is full (size: {}, max size: {}, size in bytes: {}, max size in bytes: {}), waiting to enqueue record...",
+                        randomUUIDString, queue.size(), maxQueueSize, currentQueueSizeInBytes, maxQueueSizeInBytes);
                 this.isFull.signalAll();
+                LOGGER.info("[{}] Waiting to enqueue record as batch size or queue sizeInBytes threshold reached...", randomUUIDString);
                 // queue size or queue sizeInBytes threshold reached, so wait a bit
                 this.isNotFull.await(pollInterval.toMillis(), TimeUnit.MILLISECONDS);
+                LOGGER.info("[{}] Woke up, checking if we can enqueue record...", randomUUIDString);
             }
 
             queue.enqueue(record);
@@ -258,12 +263,15 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
 
             // batch size or queue sizeInBytes threshold reached
             if (queue.size() >= maxBatchSize || (maxQueueSizeInBytes > 0 && currentQueueSizeInBytes >= maxQueueSizeInBytes)) {
+                LOGGER.info("[{}] Threshold reached, notifying poll() to drain queue...", randomUUIDString);
                 // signal poll() to start draining queue and do not wait
                 this.isFull.signalAll();
             }
         }
         finally {
             this.lock.unlock();
+            LOGGER.info("[{}] Enqueue operation completed. Current queue size: {}, max queue size: {}, current queue size in bytes: {}, max queue size in bytes: {}",
+                    randomUUIDString, queue.size(), maxQueueSize, currentQueueSizeInBytes, maxQueueSizeInBytes);
         }
     }
 
@@ -280,6 +288,7 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
 
         try {
             LOGGER.debug("polling records...");
+            long startTime = System.currentTimeMillis();
             final Timer timeout = Threads.timer(Clock.SYSTEM, Temporals.min(pollInterval, ConfigurationDefaults.RETURN_CONTROL_INTERVAL));
             try {
                 this.lock.lock();
@@ -302,10 +311,21 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
                 }
                 // signal doEnqueue() to add more records
                 this.isNotFull.signalAll();
+
+                if (!records.isEmpty()) {
+                    long duration = System.currentTimeMillis() - startTime;
+                    LOGGER.info("PERF: Poll returned {} records in {}ms, rate: {}/sec",
+                            records.size(),
+                            duration,
+                            records.size() * 1000.0 / duration);
+                }
+
                 return records;
             }
             finally {
                 this.lock.unlock();
+                LOGGER.info("poll operation completed. Current queue size: {}, max queue size: {}, current queue size in bytes: {}, max queue size in bytes: {}",
+                        queue.size(), maxQueueSize, currentQueueSizeInBytes, maxQueueSizeInBytes);
             }
         }
         finally {

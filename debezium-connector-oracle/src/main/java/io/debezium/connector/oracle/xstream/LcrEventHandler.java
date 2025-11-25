@@ -10,6 +10,7 @@ import java.time.Instant;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.UUID;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -83,12 +84,22 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
 
     @Override
     public void processLCR(LCR lcr) throws StreamsException {
-        long start = System.currentTimeMillis();
+        long start = System.nanoTime();
+        long startMs = System.currentTimeMillis();
+        String randomUUIDString = UUID.randomUUID().toString();
+        LOGGER.info("[{} LcrEventHandler] *** processLCR INVOKED *** - LCR type: {}, table: {}.{}",
+                randomUUIDString, lcr.getCommandType(), lcr.getObjectOwner(), lcr.getObjectName());
+
         LOGGER.trace("Received LCR {}", lcr);
         LOGGER.trace("Processing LCR from SCN {}", offsetContext.getScn());
         try {
+            long watermarkStart = System.nanoTime();
             // First set watermark to flush messages seen
             setWatermark();
+            long watermarkDuration = (System.nanoTime() - watermarkStart) / 1_000_000;
+            if (watermarkDuration > 100) {
+                LOGGER.info("[{} LcrEventHandler-Perf] setWatermark took {} ms - potential bottleneck", randomUUIDString, watermarkDuration);
+            }
             columnChunks.clear();
 
             final LcrPosition lcrPosition = new LcrPosition(lcr.getPosition());
@@ -97,8 +108,8 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
             LcrPosition offsetLcrPosition = LcrPosition.valueOf(offsetContext.getLcrPosition());
             if (lcrPosition.compareTo(offsetLcrPosition) <= 0) {
                 final LcrPosition recPosition = offsetLcrPosition;
-                LOGGER.info("Ignoring change event with already processed SCN/LCR Position {}/{}, last recorded {}/{}",
-                        lcrPosition,
+                LOGGER.info("{} Ignoring change event with already processed SCN/LCR Position {}/{}, last recorded {}/{}",
+                        randomUUIDString, lcrPosition,
                         lcrPosition.getScn(),
                         recPosition != null ? recPosition : "none",
                         recPosition != null ? recPosition.getScn() : "none");
@@ -114,26 +125,36 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
             offsetContext.tableEvent(new TableId(lcr.getSourceDatabaseName(), lcr.getObjectOwner(), lcr.getObjectName()),
                     lcr.getSourceTime().timestampValue().toInstant());
 
+            long processingStart = System.nanoTime();
             if (lcr instanceof RowLCR) {
+                LOGGER.info("[{} LcrEventHandler] Processing RowLCR - command: {}", randomUUIDString, ((RowLCR) lcr).getCommandType());
                 processRowLCR((RowLCR) lcr);
             }
             else if (lcr instanceof DDLLCR) {
+                LOGGER.info("[{} LcrEventHandler] Processing DDLLCR", randomUUIDString);
                 dispatchSchemaChangeEvent((DDLLCR) lcr);
             }
+            long processingDuration = (System.nanoTime() - processingStart) / 1_000_000;
+            LOGGER.info("[{} LcrEventHandler-Perf] LCR processing (dispatch) took {} ms", randomUUIDString, processingDuration);
         }
         // nothing to be done here if interrupted; the event loop will be stopped in the streaming source
         catch (InterruptedException e) {
             Thread.interrupted();
-            LOGGER.info("Received signal to stop, event loop will halt");
+            LOGGER.info("{} Received signal to stop, event loop will halt", randomUUIDString);
         }
         // XStream's receiveLCRCallback() doesn't reliably propagate exceptions, so we do that ourselves here
         catch (Exception e) {
             LOGGER.info("Error during processLCR: {}", e.getMessage());
             errorHandler.setProducerThrowable(e);
         } finally {
-            long end = System.currentTimeMillis();
-            long duration = end - start;
-            LOGGER.info("[LcrEventHandler] LCR processed in {} ms", duration);
+            long end = System.nanoTime();
+            long endMs = System.currentTimeMillis();
+            long durationNs = end - start;
+            long durationMs = endMs - startMs;
+
+            LOGGER.info("[{} LcrEventHandler] *** LCR COMPLETED *** - total time: {} ms ({} ns), SCN: {}, table: {}.{}",
+                    randomUUIDString, durationMs, durationNs, offsetContext.getScn(),
+                    lcr.getObjectOwner(), lcr.getObjectName());
         }
     }
 
@@ -159,13 +180,20 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
     private void dispatchDataChangeEvent(RowLCR lcr, Map<String, Object> chunkValues) throws InterruptedException {
         LOGGER.debug("Processing DML event {}", lcr);
 
+        long dispatchStart = System.currentTimeMillis();
+        String randomUUIDString = UUID.randomUUID().toString();
+        LOGGER.info("[{} LcrEventHandler] dispatchDataChangeEvent START - table: {}.{}, command: {}",
+                randomUUIDString, lcr.getObjectOwner(), lcr.getObjectName(), lcr.getCommandType());
         if (RowLCR.COMMIT.equals(lcr.getCommandType())) {
             final Instant commitTimestamp = lcr.getSourceTime().timestampValue().toInstant();
+            LOGGER.info("[{} LcrEventHandler] Dispatching COMMIT event - timestamp: {}", randomUUIDString, commitTimestamp);
             dispatcher.dispatchTransactionCommittedEvent(partition, offsetContext, commitTimestamp);
             return;
         }
 
         TableId tableId = getTableId(lcr);
+
+        LOGGER.info("[{} LcrEventHandler] Processing table: {}", randomUUIDString, tableId);
 
         Table table = schema.tableFor(tableId);
         if (table == null) {
@@ -256,6 +284,9 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
                         schema.tableFor(tableId),
                         schema,
                         clock));
+
+        long dispatchEnd = System.currentTimeMillis();
+        LOGGER.info("[{} LcrEventHandler] dispatchDataChangeEvent COMPLETED in {} ms", randomUUIDString, dispatchEnd - dispatchStart);
     }
 
     private void dispatchSchemaChangeEvent(DDLLCR ddlLcr) throws InterruptedException {
