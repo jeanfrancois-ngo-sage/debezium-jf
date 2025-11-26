@@ -87,11 +87,8 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
         TableId tableId = getTableId(lcr);
 
         if (!connectorConfig.getTableFilters().dataCollectionFilter().isIncluded(tableId)) {
-            LOGGER.info("Skipping LCR for not included table: {}", tableId);
-
-            // IMPORTANT: Update watermark to tell Oracle we got this LCR
-            setWatermark();
-
+            // Skip excluded tables immediately with minimal work
+            LOGGER.info("Skipping LCR for excluded table: {}", tableId);
             return;
         }
 
