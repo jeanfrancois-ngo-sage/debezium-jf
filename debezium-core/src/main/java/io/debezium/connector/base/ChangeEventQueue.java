@@ -243,19 +243,38 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
         }
 
         String randomUUIDString = UUID.randomUUID().toString();
+        int waitCycles = 0;
+        long enqueueStartTime = System.currentTimeMillis();
         try {
             this.lock.lock();
 
             LOGGER.info("[{}] Current queue size: {}, max queue size: {}, current queue size in bytes: {}, max queue size in bytes: {}", randomUUIDString, queue.size(), maxQueueSize, currentQueueSizeInBytes, maxQueueSizeInBytes);
             while (queue.size() >= maxQueueSize || (maxQueueSizeInBytes > 0 && currentQueueSizeInBytes >= maxQueueSizeInBytes)) {
+                waitCycles++;
+                boolean shouldLog = (waitCycles == 1) || (waitCycles % 20 == 0);
+                if (shouldLog) {
+                    long blockedDuration = System.currentTimeMillis() - enqueueStartTime;
+
+                    if (waitCycles == 1) {
+                        LOGGER.info("[{}] Queue FULL - Producer blocking (queue: {}/{}, bytes: {}/{})", randomUUIDString, queue.size(), maxQueueSize, currentQueueSizeInBytes, maxQueueSizeInBytes);
+                    } else if (waitCycles >= 20) {
+                        LOGGER.info("[{}] !!! Producer blocked {} cycles ({}ms) - Consumer too slow! Queue: {}/{}", randomUUIDString, waitCycles, blockedDuration, queue.size(), maxQueueSize);
+                    } else {
+                        LOGGER.info("[{}] Producer still blocked - cycle: {}, duration: {}ms, queue: {}/{}", randomUUIDString, waitCycles, blockedDuration, queue.size(), maxQueueSize);
+                    }
+                }
+
+                this.lock.unlock();
                 // signal poll() to drain queue
-                LOGGER.info("[{}] Queue is full (size: {}, max size: {}, size in bytes: {}, max size in bytes: {}), waiting to enqueue record...",
-                        randomUUIDString, queue.size(), maxQueueSize, currentQueueSizeInBytes, maxQueueSizeInBytes);
                 this.isFull.signalAll();
-                LOGGER.info("[{}] Waiting to enqueue record as batch size or queue sizeInBytes threshold reached...", randomUUIDString);
                 // queue size or queue sizeInBytes threshold reached, so wait a bit
                 this.isNotFull.await(pollInterval.toMillis(), TimeUnit.MILLISECONDS);
-                LOGGER.info("[{}] Woke up, checking if we can enqueue record...", randomUUIDString);
+                this.lock.lock();
+            }
+
+            if (waitCycles > 0) {
+                long totalWaitTime = System.currentTimeMillis() - enqueueStartTime;
+                LOGGER.info("[{}] Producer UNBLOCKED - waited {} cycles ({}ms), queue now: {}/{}", randomUUIDString, waitCycles, totalWaitTime, queue.size(), maxQueueSize);
             }
 
             queue.enqueue(record);
@@ -275,8 +294,10 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
         }
         finally {
             this.lock.unlock();
-            LOGGER.info("[{}] Enqueue operation completed. Current queue size: {}, max queue size: {}, current queue size in bytes: {}, max queue size in bytes: {}",
-                    randomUUIDString, queue.size(), maxQueueSize, currentQueueSizeInBytes, maxQueueSizeInBytes);
+            long totalDuration = System.currentTimeMillis() - enqueueStartTime;
+            if (waitCycles > 0 || totalDuration > 100) {
+                LOGGER.info("[{}] Enqueue completed in {}ms ({} wait cycles) - queue: {}/{}", randomUUIDString, totalDuration, waitCycles, queue.size(), maxQueueSize);
+            }
         }
     }
 
