@@ -409,6 +409,13 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
 
     @Override
     public void processChunk(ChunkColumnValue chunk) throws StreamsException {
+        // If currentRow is null, it means the LCR was filtered out (excluded table)
+        // Skip processing chunks for excluded tables
+        if (currentRow == null) {
+            LOGGER.info("Skipping chunk for excluded table (currentRow is null)");
+            return;
+        }
+
         columnChunks.computeIfAbsent(chunk.getColumnName(), v -> new ChunkColumnValues()).add(chunk);
         if (chunk.isEndOfRow()) {
             resolveAndDispatchCurrentChunkedRow();
