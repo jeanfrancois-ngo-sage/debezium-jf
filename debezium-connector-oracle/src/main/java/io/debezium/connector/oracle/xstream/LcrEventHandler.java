@@ -88,6 +88,8 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
 
         if (!connectorConfig.getTableFilters().dataCollectionFilter().isIncluded(tableId)) {
             // Skip excluded tables immediately with minimal work
+            // Reset currentRow to prevent chunk processing from previous table
+            currentRow = null;
             LOGGER.info("Skipping LCR for excluded table: {}", tableId);
             return;
         }
