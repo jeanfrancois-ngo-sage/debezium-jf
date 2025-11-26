@@ -84,9 +84,21 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
 
     @Override
     public void processLCR(LCR lcr) throws StreamsException {
+        TableId tableId = getTableId(lcr);
+
+        if (!connectorConfig.getTableFilters().dataCollectionFilter().isIncluded(tableId)) {
+            LOGGER.info("Skipping LCR for not included table: {}", tableId);
+
+            // IMPORTANT: Update watermark to tell Oracle we got this LCR
+            setWatermark();
+
+            return;
+        }
+
         long start = System.nanoTime();
         long startMs = System.currentTimeMillis();
         String randomUUIDString = UUID.randomUUID().toString();
+
         LOGGER.info("[{} LcrEventHandler] *** processLCR INVOKED *** - LCR type: {}, table: {}.{}",
                 randomUUIDString, lcr.getCommandType(), lcr.getObjectOwner(), lcr.getObjectName());
 
@@ -393,6 +405,7 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
             LOGGER.trace("Offsets recorded to Oracle");
         }
         catch (StreamsException e) {
+            LOGGER.error("Error while processing offsets to Oracle", e);
             throw new DebeziumException("Couldn't set processed low watermark", e);
         }
     }
