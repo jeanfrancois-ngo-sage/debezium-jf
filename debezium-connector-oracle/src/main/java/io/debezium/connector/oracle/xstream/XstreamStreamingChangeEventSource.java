@@ -129,12 +129,17 @@ public class XstreamStreamingChangeEventSource implements StreamingChangeEventSo
                     long receiveEnd = System.currentTimeMillis();
                     long receiveDuration = receiveEnd - receiveStart;
                     LOGGER.info("[XStream-Perf] AFTER receiveLCRCallback - callback took {} ms", receiveDuration);
+
+                    // Check if processLCR was actually called (LCR was delivered)
+                    boolean lcrWasDelivered = eventHandler.checkAndResetLcrProcessedFlag();
+
                     if (context.isPaused()) {
                         LOGGER.info("[XStream] Streaming will now pause (LCR count {})", lcrCount);
                         context.streamingPaused();
                         context.waitSnapshotCompletion();
                         LOGGER.info("[XStream] Streaming resumed (LCR count {})", lcrCount);
                     }
+
                     Scn currentScn = effectiveOffset != null ? effectiveOffset.getScn() : null;
                     if (currentScn != null && (!currentScn.equals(lastScn))) {
                         LOGGER.info("[XStream-Perf] *** SCN TRANSITION: {} -> {} | LCRs for prev SCN: {} ***",
@@ -142,11 +147,17 @@ public class XstreamStreamingChangeEventSource implements StreamingChangeEventSo
                         lcrCount = 0;
                         lastScn = currentScn;
                     }
-                    lcrCount++;
-                    totalLcrCount++;
 
-                    LOGGER.info("[XStream] Received LCR (scnCount: {}, total: {}, iteration: {}), receiveLCRCallback duration: {} ms, currentScn: {}",
-                            lcrCount, totalLcrCount, loopIterations, receiveDuration, currentScn);
+                    // Only increment counters if an LCR was actually delivered
+                    if (lcrWasDelivered) {
+                        lcrCount++;
+                        totalLcrCount++;
+                        LOGGER.info("[XStream] LCR processed (scnCount: {}, total: {}, iteration: {}), receiveLCRCallback duration: {} ms, currentScn: {}",
+                                lcrCount, totalLcrCount, loopIterations, receiveDuration, currentScn);
+                    } else {
+                        LOGGER.debug("[XStream] receiveLCRCallback returned without LCR data (iteration: {}, duration: {} ms)",
+                                loopIterations, receiveDuration);
+                    }
 
                     if (receiveDuration > 1000) {
                         LOGGER.info("[XStream-Perf] SLOW CALLBACK: receiveLCRCallback took {} ms - this is unusually slow", receiveDuration);

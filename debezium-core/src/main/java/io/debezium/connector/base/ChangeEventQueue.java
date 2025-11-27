@@ -247,8 +247,9 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
         long enqueueStartTime = System.currentTimeMillis();
         try {
             this.lock.lock();
+            LOGGER.info("[{} doEnqueue] Lock ACQUIRED - queue: {}/{}, bytes: {}/{}",
+                    randomUUIDString, queue.size(), maxQueueSize, currentQueueSizeInBytes, maxQueueSizeInBytes);
 
-            LOGGER.info("[{}] Current queue size: {}, max queue size: {}, current queue size in bytes: {}, max queue size in bytes: {}", randomUUIDString, queue.size(), maxQueueSize, currentQueueSizeInBytes, maxQueueSizeInBytes);
             while (queue.size() >= maxQueueSize || (maxQueueSizeInBytes > 0 && currentQueueSizeInBytes >= maxQueueSizeInBytes)) {
                 waitCycles++;
                 boolean shouldLog = (waitCycles == 1) || (waitCycles % 20 == 0);
@@ -264,12 +265,25 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
                     }
                 }
 
-                this.lock.unlock();
-                // signal poll() to drain queue
+                // Signal poll() that queue is full and needs draining (while holding lock)
+                LOGGER.info("[{} doEnqueue] SIGNALING isFull.signalAll() - notifying consumer (cycle {})", randomUUIDString, waitCycles);
                 this.isFull.signalAll();
-                // queue size or queue sizeInBytes threshold reached, so wait a bit
-                this.isNotFull.await(pollInterval.toMillis(), TimeUnit.MILLISECONDS);
-                this.lock.lock();
+
+                // Wait for poll() to drain queue and signal that space is available
+                // Note: await() automatically releases the lock while waiting and re-acquires it when signaled
+                LOGGER.info("[{} doEnqueue] BEFORE isNotFull.await() - will release lock and wait {} ms (cycle {})",
+                        randomUUIDString, pollInterval.toMillis(), waitCycles);
+                long awaitStart = System.currentTimeMillis();
+                boolean wasSignaled = this.isNotFull.await(pollInterval.toMillis(), TimeUnit.MILLISECONDS);
+                long awaitDuration = System.currentTimeMillis() - awaitStart;
+
+                if (wasSignaled) {
+                    LOGGER.info("[{} doEnqueue] AFTER isNotFull.await() - SIGNALED by consumer after {} ms (cycle {}), queue now: {}/{}",
+                            randomUUIDString, awaitDuration, waitCycles, queue.size(), maxQueueSize);
+                } else {
+                    LOGGER.info("[{} doEnqueue] AFTER isNotFull.await() - TIMEOUT after {} ms (cycle {}), queue still: {}/{} - NO SIGNAL RECEIVED!",
+                            randomUUIDString, awaitDuration, waitCycles, queue.size(), maxQueueSize);
+                }
             }
 
             if (waitCycles > 0) {
@@ -277,6 +291,7 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
                 LOGGER.info("[{}] Producer UNBLOCKED - waited {} cycles ({}ms), queue now: {}/{}", randomUUIDString, waitCycles, totalWaitTime, queue.size(), maxQueueSize);
             }
 
+            LOGGER.info("[{} doEnqueue] Adding record to queue (current size: {})", randomUUIDString, queue.size());
             queue.enqueue(record);
             // If we pass a positiveLong max.queue.size.in.bytes to enable handling queue size in bytes feature
             if (maxQueueSizeInBytes > 0) {
@@ -287,7 +302,7 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
 
             // batch size or queue sizeInBytes threshold reached
             if (queue.size() >= maxBatchSize || (maxQueueSizeInBytes > 0 && currentQueueSizeInBytes >= maxQueueSizeInBytes)) {
-                LOGGER.info("[{}] Threshold reached, notifying poll() to drain queue...", randomUUIDString);
+                LOGGER.info("[{}] Threshold reached, notifying poll() to drain queue... (queue: {}/{})", randomUUIDString, queue.size(), maxQueueSize);
                 // signal poll() to start draining queue and do not wait
                 this.isFull.signalAll();
             }
@@ -296,7 +311,8 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
             this.lock.unlock();
             long totalDuration = System.currentTimeMillis() - enqueueStartTime;
             if (waitCycles > 0 || totalDuration > 100) {
-                LOGGER.info("[{}] Enqueue completed in {}ms ({} wait cycles) - queue: {}/{}", randomUUIDString, totalDuration, waitCycles, queue.size(), maxQueueSize);
+                LOGGER.info("[{} doEnqueue] Lock RELEASED - Enqueue completed in {}ms ({} wait cycles) - queue: {}/{}",
+                        randomUUIDString, totalDuration, waitCycles, queue.size(), maxQueueSize);
             }
         }
     }
@@ -312,46 +328,78 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
     public List<T> poll() throws InterruptedException {
         LoggingContext.PreviousContext previousContext = loggingContextSupplier.get();
 
+        String pollUUID = UUID.randomUUID().toString();
+        LOGGER.info("[{} poll] ========== POLL CALLED BY KAFKA CONNECT ==========", pollUUID);
+
         try {
-            LOGGER.debug("polling records...");
+            LOGGER.info("[{} poll] Attempting to acquire lock...", pollUUID);
             long startTime = System.currentTimeMillis();
             final Timer timeout = Threads.timer(Clock.SYSTEM, Temporals.min(pollInterval, ConfigurationDefaults.RETURN_CONTROL_INTERVAL));
             try {
                 this.lock.lock();
+                long lockAcquiredTime = System.currentTimeMillis();
+                LOGGER.info("[{} poll] Lock ACQUIRED after {} ms - queue: {}/{}, bytes: {}/{}",
+                        pollUUID, lockAcquiredTime - startTime, queue.size(), maxQueueSize,
+                        currentQueueSizeInBytes, maxQueueSizeInBytes);
+
                 List<T> records = new ArrayList<>(Math.min(maxBatchSize, queue.size()));
                 throwProducerExceptionIfPresent();
+
+                int drainAttempts = 0;
                 while (drainRecords(records, maxBatchSize - records.size()) < maxBatchSize
                         && (maxQueueSizeInBytes == 0 || currentQueueSizeInBytes < maxQueueSizeInBytes)
                         && !timeout.expired()) {
+                    drainAttempts++;
                     throwProducerExceptionIfPresent();
 
-                    LOGGER.debug("no records available or batch size not reached yet, sleeping a bit...");
+                    LOGGER.info("[{} poll] Drain attempt {} - not enough records yet (have: {}, want: {}), sleeping a bit...",
+                            pollUUID, drainAttempts, records.size(), maxBatchSize);
                     long remainingTimeoutMills = timeout.remaining().toMillis();
                     if (remainingTimeoutMills > 0) {
                         // signal doEnqueue() to add more records
+                        LOGGER.info("[{} poll] SIGNALING isNotFull.signalAll() - telling producer there's space (attempt {})",
+                                pollUUID, drainAttempts);
                         this.isNotFull.signalAll();
+
                         // no records available or batch size not reached yet, so wait a bit
-                        this.isFull.await(remainingTimeoutMills, TimeUnit.MILLISECONDS);
+                        LOGGER.info("[{} poll] BEFORE isFull.await() - waiting {} ms for more records (attempt {})",
+                                pollUUID, remainingTimeoutMills, drainAttempts);
+                        long awaitStart = System.currentTimeMillis();
+                        boolean wasSignaled = this.isFull.await(remainingTimeoutMills, TimeUnit.MILLISECONDS);
+                        long awaitDuration = System.currentTimeMillis() - awaitStart;
+
+                        if (wasSignaled) {
+                            LOGGER.info("[{} poll] AFTER isFull.await() - SIGNALED by producer after {} ms (attempt {})",
+                                    pollUUID, awaitDuration, drainAttempts);
+                        } else {
+                            LOGGER.info("[{} poll] AFTER isFull.await() - TIMEOUT after {} ms (attempt {}) - NO SIGNAL",
+                                    pollUUID, awaitDuration, drainAttempts);
+                        }
                     }
-                    LOGGER.debug("checking for more records...");
+                    LOGGER.info("[{} poll] Checking for more records... (current: {}, target: {})",
+                            pollUUID, records.size(), maxBatchSize);
                 }
+
                 // signal doEnqueue() to add more records
+                LOGGER.info("[{} poll] FINAL SIGNAL - isNotFull.signalAll() to wake any blocked producers", pollUUID);
                 this.isNotFull.signalAll();
 
                 if (!records.isEmpty()) {
                     long duration = System.currentTimeMillis() - startTime;
-                    LOGGER.info("PERF: Poll returned {} records in {}ms, rate: {}/sec",
-                            records.size(),
-                            duration,
-                            records.size() * 1000.0 / duration);
+                    LOGGER.info("[{} poll] PERF: Poll returned {} records in {}ms, rate: {}/sec",
+                            pollUUID, records.size(), duration, records.size() * 1000.0 / duration);
+                } else {
+                    LOGGER.info("[{} poll] Returning EMPTY list - no records available", pollUUID);
                 }
 
                 return records;
             }
             finally {
                 this.lock.unlock();
-                LOGGER.info("poll operation completed. Current queue size: {}, max queue size: {}, current queue size in bytes: {}, max queue size in bytes: {}",
-                        queue.size(), maxQueueSize, currentQueueSizeInBytes, maxQueueSizeInBytes);
+                long totalDuration = System.currentTimeMillis() - startTime;
+                LOGGER.info("[{} poll] Lock RELEASED - poll operation completed in {} ms. Queue size: {}/{}, bytes: {}/{}",
+                        pollUUID, totalDuration, queue.size(), maxQueueSize, currentQueueSizeInBytes, maxQueueSizeInBytes);
+                LOGGER.info("[{} poll] ========== POLL COMPLETED ==========", pollUUID);
             }
         }
         finally {
@@ -365,6 +413,7 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
             return records.size();
         }
         int recordsToDrain = Math.min(queueSize, maxElements);
+        LOGGER.info("Draining {} records from queue (current size: {})", recordsToDrain, queueSize);
         T[] drainedRecords = (T[]) new Sizeable[recordsToDrain];
         for (int i = 0; i < recordsToDrain; i++) {
             T record = queue.poll();
@@ -377,6 +426,7 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
             }
         }
         records.addAll(Arrays.asList(drainedRecords));
+        LOGGER.info("Drained {} records from queue, new queue size: {}", records.size(), queue.size());
         return records.size();
     }
 
@@ -386,6 +436,7 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
 
     private void throwProducerExceptionIfPresent() {
         if (producerException != null) {
+            LOGGER.info("Throwing producer exception to consumer: {}", producerException.getMessage());
             throw producerException;
         }
     }

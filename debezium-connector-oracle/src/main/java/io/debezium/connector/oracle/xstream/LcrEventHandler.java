@@ -63,6 +63,8 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
     private final XStreamStreamingChangeEventSourceMetrics streamingMetrics;
     private final Map<String, ChunkColumnValues> columnChunks;
     private RowLCR currentRow;
+    private long processLcrInvocationCount = 0; // Track how many times processLCR is called
+    private volatile boolean lcrWasProcessedInLastCallback = false; // Track if LCR was actually received
 
     LcrEventHandler(OracleConnectorConfig connectorConfig, ErrorHandler errorHandler,
                     EventDispatcher<OraclePartition, TableId> dispatcher, Clock clock,
@@ -84,13 +86,18 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
 
     @Override
     public void processLCR(LCR lcr) throws StreamsException {
+        lcrWasProcessedInLastCallback = true; // Mark that we received an LCR
+        processLcrInvocationCount++;
+        LOGGER.info("[LcrEventHandler] processLCR called - invocation #{}, table: {}.{}",
+                processLcrInvocationCount, lcr.getObjectOwner(), lcr.getObjectName());
+
         TableId tableId = getTableId(lcr);
 
         if (!connectorConfig.getTableFilters().dataCollectionFilter().isIncluded(tableId)) {
             // Skip excluded tables immediately with minimal work
             // Reset currentRow to prevent chunk processing from previous table
             currentRow = null;
-            LOGGER.info("Skipping LCR for excluded table: {}", tableId);
+            LOGGER.info("Skipping LCR for excluded table: {} (total invocations: {})", tableId, processLcrInvocationCount);
             return;
         }
 
@@ -481,5 +488,15 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
         catch (SQLException e) {
             throw new DebeziumException("Failed to process chunk data", e);
         }
+    }
+
+    /**
+     * Check if an LCR was processed in the last receiveLCRCallback invocation and reset the flag.
+     * @return true if processLCR was called, false otherwise
+     */
+    boolean checkAndResetLcrProcessedFlag() {
+        boolean wasProcessed = lcrWasProcessedInLastCallback;
+        lcrWasProcessedInLastCallback = false;
+        return wasProcessed;
     }
 }
