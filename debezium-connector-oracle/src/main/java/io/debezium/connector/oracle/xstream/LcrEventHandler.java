@@ -66,6 +66,7 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
     private final Map<String, Long> processLcrInvocationCountPerTable = new HashMap<>(); // Track how many times processLCR is called per table
     private volatile boolean lcrWasProcessedInLastCallback = false; // Track if LCR was actually received
     private long lastWatermarkTimeMs = 0; // Track last time we set watermark
+    private LcrPosition lastWatermarkPosition = null; // Track last watermark position to avoid setting older positions
     private static final long WATERMARK_TIME_INTERVAL_MS = 60_000; // Force watermark every 60 seconds (1 minute) for 2-min max latency requirement
     private static final int MAX_TABLE_TRACKING_SIZE = 1000; // Maximum number of tables to track invocation count
 
@@ -401,14 +402,23 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
             if (message == null) {
                 return;
             }
-            LOGGER.debug("Recording offsets to Oracle");
+
+            // Check if this position is newer than the last watermark we set
             if (message.position != null) {
+                final LcrPosition newPosition = message.position;
+                if (lastWatermarkPosition != null && newPosition.compareTo(lastWatermarkPosition) <= 0) {
+                    LOGGER.debug("Skipping watermark update - new position {} is not greater than last watermark {}", newPosition, lastWatermarkPosition);
+                    return;
+                }
+
+                LOGGER.debug("Recording offsets to Oracle");
                 if (LOGGER.isDebugEnabled()) {
-                    LOGGER.debug("Recording position {}", message.position);
+                    LOGGER.debug("Recording position {}", newPosition);
                 }
                 eventSource.getXsOut().setProcessedLowWatermark(
-                        message.position.getRawPosition(),
+                        newPosition.getRawPosition(),
                         XStreamOut.DEFAULT_MODE);
+                lastWatermarkPosition = newPosition;
             }
             else if (message.scn != null) {
                 if (LOGGER.isDebugEnabled()) {
@@ -440,11 +450,19 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
             return;
         }
         try {
-            LOGGER.debug("Recording filtered LCR position to Oracle");
             final LcrPosition lcrPosition = new LcrPosition(lcr.getPosition());
+
+            // Check if this position is newer than the last watermark we set
+            if (lastWatermarkPosition != null && lcrPosition.compareTo(lastWatermarkPosition) <= 0) {
+                LOGGER.debug("Skipping filtered LCR watermark update - position {} is not greater than last watermark {}", lcrPosition, lastWatermarkPosition);
+                return;
+            }
+
+            LOGGER.debug("Recording filtered LCR position to Oracle");
             eventSource.getXsOut().setProcessedLowWatermark(
                     lcrPosition.getRawPosition(),
                     XStreamOut.DEFAULT_MODE);
+            lastWatermarkPosition = lcrPosition;
             LOGGER.info("Filtered LCR position recorded to Oracle: table {}", tableKey);
         }
         catch (StreamsException e) {
