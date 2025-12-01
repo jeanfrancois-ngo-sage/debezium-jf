@@ -441,8 +441,9 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
         }
         try {
             LOGGER.debug("Recording filtered LCR position to Oracle");
+            final LcrPosition lcrPosition = new LcrPosition(lcr.getPosition());
             eventSource.getXsOut().setProcessedLowWatermark(
-                    lcr.getPosition().getRawPosition(),
+                    lcrPosition.getRawPosition(),
                     XStreamOut.DEFAULT_MODE);
             LOGGER.info("Filtered LCR position recorded to Oracle: table {}", tableKey);
         }
