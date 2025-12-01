@@ -117,10 +117,13 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
                 if ((currentTimeMs - lastWatermarkTimeMs) >= WATERMARK_TIME_INTERVAL_MS) {
                     LOGGER.info("Time-based watermark threshold reached ({} ms since last watermark) for filtered LCR, updating watermark", currentTimeMs - lastWatermarkTimeMs);
                     long watermarkStart = System.nanoTime();
-                    setWatermarkFromLcr(lcr, tableKey);
+                    boolean watermarkUpdated = setWatermarkFromLcr(lcr, tableKey);
                     long watermarkDuration = (System.nanoTime() - watermarkStart) / 1_000_000;
                     LOGGER.info("[{} LcrEventHandler-Perf] setWatermark for filtered LCRs took {} ms", randomUUIDString, watermarkDuration);
-                    lastWatermarkTimeMs = currentTimeMs;
+                    // Only reset timer if watermark was actually updated
+                    if (watermarkUpdated) {
+                        lastWatermarkTimeMs = currentTimeMs;
+                    }
                 }
 
                 columnChunks.clear();
@@ -132,7 +135,6 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
             LOGGER.info("[{} LcrEventHandler] processLCR invocation #{} - LCR type: {}, table: {}", randomUUIDString, tableInvocationCount, lcr.getCommandType(), tableId);
 
             setWatermark();
-            lastWatermarkTimeMs = System.currentTimeMillis();
             columnChunks.clear();
 
             final LcrPosition lcrPosition = new LcrPosition(lcr.getPosition());
@@ -419,6 +421,8 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
                         newPosition.getRawPosition(),
                         XStreamOut.DEFAULT_MODE);
                 lastWatermarkPosition = newPosition;
+                // Update time tracking to coordinate with filtered LCR watermarks
+                lastWatermarkTimeMs = System.currentTimeMillis();
             }
             else if (message.scn != null) {
                 if (LOGGER.isDebugEnabled()) {
@@ -427,6 +431,8 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
                 eventSource.getXsOut().setProcessedLowWatermark(
                         message.scn,
                         XStreamOut.DEFAULT_MODE);
+                // Update time tracking even for SCN-only watermarks
+                lastWatermarkTimeMs = System.currentTimeMillis();
             }
             else {
                 LOGGER.warn("Nothing in offsets could be recorded to Oracle");
@@ -444,10 +450,12 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
      * Set watermark directly from the current LCR position.
      * This is used for filtered LCRs that never get dispatched to Kafka,
      * so they won't be in the offset queue that setWatermark() reads from.
+     *
+     * @return true if watermark was updated, false if skipped due to position check
      */
-    private void setWatermarkFromLcr(LCR lcr, String tableKey) {
+    private boolean setWatermarkFromLcr(LCR lcr, String tableKey) {
         if (eventSource.getXsOut() == null) {
-            return;
+            return false;
         }
         try {
             final LcrPosition lcrPosition = new LcrPosition(lcr.getPosition());
@@ -455,7 +463,7 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
             // Check if this position is newer than the last watermark we set
             if (lastWatermarkPosition != null && lcrPosition.compareTo(lastWatermarkPosition) <= 0) {
                 LOGGER.debug("Skipping filtered LCR watermark update - position {} is not greater than last watermark {}", lcrPosition, lastWatermarkPosition);
-                return;
+                return false;
             }
 
             LOGGER.debug("Recording filtered LCR position to Oracle");
@@ -464,6 +472,7 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
                     XStreamOut.DEFAULT_MODE);
             lastWatermarkPosition = lcrPosition;
             LOGGER.info("Filtered LCR position recorded to Oracle: table {}", tableKey);
+            return true;
         }
         catch (StreamsException e) {
             LOGGER.error("Error while processing filtered LCR offset to Oracle: {}", e.getMessage());
