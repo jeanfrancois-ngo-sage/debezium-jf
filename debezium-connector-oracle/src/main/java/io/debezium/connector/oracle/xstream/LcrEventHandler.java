@@ -109,8 +109,6 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
                 LOGGER.warn("Table tracking limit ({}) reached, not tracking invocation count for table: {}", MAX_TABLE_TRACKING_SIZE, tableId);
             }
 
-            LOGGER.info("[{} LcrEventHandler] processLCR invocation #{} - LCR type: {}, table: {}", randomUUIDString, tableInvocationCount, lcr.getCommandType(), tableId);
-
             boolean isFiltered = !connectorConfig.getTableFilters().dataCollectionFilter().isIncluded(tableId);
 
             if (isFiltered) {
@@ -118,7 +116,7 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
                 if ((currentTimeMs - lastWatermarkTimeMs) >= WATERMARK_TIME_INTERVAL_MS) {
                     LOGGER.info("Time-based watermark threshold reached ({} ms since last watermark) for filtered LCR, updating watermark", currentTimeMs - lastWatermarkTimeMs);
                     long watermarkStart = System.nanoTime();
-                    setWatermark();
+                    setWatermarkFromLcr(lcr, tableKey);
                     long watermarkDuration = (System.nanoTime() - watermarkStart) / 1_000_000;
                     LOGGER.info("[{} LcrEventHandler-Perf] setWatermark for filtered LCRs took {} ms", randomUUIDString, watermarkDuration);
                     lastWatermarkTimeMs = currentTimeMs;
@@ -129,6 +127,8 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
                 LOGGER.info("Skipping LCR for excluded table: {} (table invocations: {})", tableId, tableInvocationCount);
                 return;
             }
+
+            LOGGER.info("[{} LcrEventHandler] processLCR invocation #{} - LCR type: {}, table: {}", randomUUIDString, tableInvocationCount, lcr.getCommandType(), tableId);
 
             setWatermark();
             lastWatermarkTimeMs = System.currentTimeMillis();
@@ -425,8 +425,30 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
             LOGGER.trace("Offsets recorded to Oracle");
         }
         catch (StreamsException e) {
-            LOGGER.error("Error while processing offsets to Oracle", e);
+            LOGGER.error("Error while processing offsets to Oracle: {}", e.getMessage());
             throw new DebeziumException("Couldn't set processed low watermark", e);
+        }
+    }
+
+    /**
+     * Set watermark directly from the current LCR position.
+     * This is used for filtered LCRs that never get dispatched to Kafka,
+     * so they won't be in the offset queue that setWatermark() reads from.
+     */
+    private void setWatermarkFromLcr(LCR lcr, String tableKey) {
+        if (eventSource.getXsOut() == null) {
+            return;
+        }
+        try {
+            LOGGER.debug("Recording filtered LCR position to Oracle");
+            eventSource.getXsOut().setProcessedLowWatermark(
+                    lcr.getPosition().getRawPosition(),
+                    XStreamOut.DEFAULT_MODE);
+            LOGGER.info("Filtered LCR position recorded to Oracle: table {}", tableKey);
+        }
+        catch (StreamsException e) {
+            LOGGER.error("Error while processing filtered LCR offset to Oracle: {}", e.getMessage());
+            throw new DebeziumException("Couldn't set processed low watermark for filtered LCR", e);
         }
     }
 
