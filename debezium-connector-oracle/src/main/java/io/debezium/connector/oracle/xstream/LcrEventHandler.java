@@ -63,8 +63,11 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
     private final XStreamStreamingChangeEventSourceMetrics streamingMetrics;
     private final Map<String, ChunkColumnValues> columnChunks;
     private RowLCR currentRow;
-    private long processLcrInvocationCount = 0; // Track how many times processLCR is called
+    private final Map<String, Long> processLcrInvocationCountPerTable = new HashMap<>(); // Track how many times processLCR is called per table
     private volatile boolean lcrWasProcessedInLastCallback = false; // Track if LCR was actually received
+    private long lastWatermarkTimeMs = 0; // Track last time we set watermark
+    private static final long WATERMARK_TIME_INTERVAL_MS = 60_000; // Force watermark every 60 seconds (1 minute) for 2-min max latency requirement
+    private static final int MAX_TABLE_TRACKING_SIZE = 1000; // Maximum number of tables to track invocation count
 
     LcrEventHandler(OracleConnectorConfig connectorConfig, ErrorHandler errorHandler,
                     EventDispatcher<OraclePartition, TableId> dispatcher, Clock clock,
@@ -86,38 +89,49 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
 
     @Override
     public void processLCR(LCR lcr) throws StreamsException {
-        lcrWasProcessedInLastCallback = true; // Mark that we received an LCR
-        processLcrInvocationCount++;
-        LOGGER.info("[LcrEventHandler] processLCR called - invocation #{}, table: {}.{}",
-                processLcrInvocationCount, lcr.getObjectOwner(), lcr.getObjectName());
-
-        TableId tableId = getTableId(lcr);
-
-        if (!connectorConfig.getTableFilters().dataCollectionFilter().isIncluded(tableId)) {
-            // Skip excluded tables immediately with minimal work
-            // Reset currentRow to prevent chunk processing from previous table
-            currentRow = null;
-            LOGGER.info("Skipping LCR for excluded table: {} (total invocations: {})", tableId, processLcrInvocationCount);
-            return;
-        }
+        lcrWasProcessedInLastCallback = true;
 
         long start = System.nanoTime();
         long startMs = System.currentTimeMillis();
         String randomUUIDString = UUID.randomUUID().toString();
 
-        LOGGER.info("[{} LcrEventHandler] *** processLCR INVOKED *** - LCR type: {}, table: {}.{}",
-                randomUUIDString, lcr.getCommandType(), lcr.getObjectOwner(), lcr.getObjectName());
-
         LOGGER.trace("Received LCR {}", lcr);
         LOGGER.trace("Processing LCR from SCN {}", offsetContext.getScn());
         try {
-            long watermarkStart = System.nanoTime();
-            // First set watermark to flush messages seen
-            setWatermark();
-            long watermarkDuration = (System.nanoTime() - watermarkStart) / 1_000_000;
-            if (watermarkDuration > 100) {
-                LOGGER.info("[{} LcrEventHandler-Perf] setWatermark took {} ms - potential bottleneck", randomUUIDString, watermarkDuration);
+            TableId tableId = getTableId(lcr);
+
+            String tableKey = tableId.toString();
+            long tableInvocationCount;
+            if (processLcrInvocationCountPerTable.size() < MAX_TABLE_TRACKING_SIZE || processLcrInvocationCountPerTable.containsKey(tableKey)) {
+                tableInvocationCount = processLcrInvocationCountPerTable.compute(tableKey, (k, v) -> (v == null) ? 1L : v + 1L);
+            } else {
+                tableInvocationCount = 0; // Don't track new tables if we've hit the limit
+                LOGGER.warn("Table tracking limit ({}) reached, not tracking invocation count for table: {}", MAX_TABLE_TRACKING_SIZE, tableId);
             }
+
+            LOGGER.info("[{} LcrEventHandler] processLCR invocation #{} - LCR type: {}, table: {}", randomUUIDString, tableInvocationCount, lcr.getCommandType(), tableId);
+
+            boolean isFiltered = !connectorConfig.getTableFilters().dataCollectionFilter().isIncluded(tableId);
+
+            if (isFiltered) {
+                long currentTimeMs = System.currentTimeMillis();
+                if ((currentTimeMs - lastWatermarkTimeMs) >= WATERMARK_TIME_INTERVAL_MS) {
+                    LOGGER.info("Time-based watermark threshold reached ({} ms since last watermark) for filtered LCR, updating watermark", currentTimeMs - lastWatermarkTimeMs);
+                    long watermarkStart = System.nanoTime();
+                    setWatermark();
+                    long watermarkDuration = (System.nanoTime() - watermarkStart) / 1_000_000;
+                    LOGGER.info("[{} LcrEventHandler-Perf] setWatermark for filtered LCRs took {} ms", randomUUIDString, watermarkDuration);
+                    lastWatermarkTimeMs = currentTimeMs;
+                }
+
+                columnChunks.clear();
+                currentRow = null;
+                LOGGER.info("Skipping LCR for excluded table: {} (table invocations: {})", tableId, tableInvocationCount);
+                return;
+            }
+
+            setWatermark();
+            lastWatermarkTimeMs = System.currentTimeMillis();
             columnChunks.clear();
 
             final LcrPosition lcrPosition = new LcrPosition(lcr.getPosition());
@@ -149,7 +163,7 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
                 processRowLCR((RowLCR) lcr);
             }
             else if (lcr instanceof DDLLCR) {
-                LOGGER.info("[{} LcrEventHandler] Processing DDLLCR", randomUUIDString);
+                LOGGER.info("[{} LcrEventHandler] Processing DDL LCR", randomUUIDString);
                 dispatchSchemaChangeEvent((DDLLCR) lcr);
             }
             long processingDuration = (System.nanoTime() - processingStart) / 1_000_000;
