@@ -189,13 +189,42 @@ public class XstreamStreamingChangeEventSource implements StreamingChangeEventSo
 
     @Override
     public void commitOffset(Map<String, ?> partition, Map<String, ?> offset) {
-        if (xsOut != null) {
-            LOGGER.debug("Sending message to request recording of offsets to Oracle");
+        try {
+            if (xsOut == null) {
+                LOGGER.warn("Cannot commit offset to Oracle - XStream connection is null (disconnected?)");
+                return;
+            }
+
+            LOGGER.info("Processing offset commit request from Kafka Connect: partition={}, offset keys={}",
+                        partition, offset.keySet());
+
             final LcrPosition lcrPosition = LcrPosition.valueOf((String) offset.get(SourceInfo.LCR_POSITION_KEY));
             final Scn scn = OracleOffsetContext.getScnFromOffsetMapByKey(offset, SourceInfo.SCN_KEY);
+
+            // Calculate SCN age to detect lag
+            Scn currentScn = effectiveOffset != null ? effectiveOffset.getScn() : null;
+            if (currentScn != null && scn != null) {
+                long scnDiff = currentScn.longValue() - scn.longValue();
+                if (scnDiff > 10000) {
+                    LOGGER.warn("OFFSET LAG WARNING: Committing SCN {} but current processing SCN is {} (diff: {} SCNs behind)",
+                               scn, currentScn, scnDiff);
+                } else {
+                    LOGGER.info("Parsed offset for Oracle watermark: LCR position={}, SCN={} (current SCN: {}, diff: {})",
+                               lcrPosition, scn, currentScn, scnDiff);
+                }
+            } else {
+                LOGGER.info("Parsed offset for Oracle watermark: LCR position={}, SCN={}", lcrPosition, scn);
+            }
+
             // We can safely overwrite the message even if it was not processed. The watermarked will be set to the highest
             // (last) delivered value in a single step instead of incrementally
             sendPublishedPosition(lcrPosition, scn);
+
+            LOGGER.info("Offset position sent to message box (will be applied to Oracle during next LCR processing cycle)");
+        }
+        catch (Exception e) {
+            LOGGER.error("CRITICAL: Failed to process offset commit to XStream", e);
+            throw new DebeziumException("Failed to commit offset to XStream", e);
         }
     }
 

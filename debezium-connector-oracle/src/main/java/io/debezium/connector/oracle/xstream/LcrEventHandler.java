@@ -381,38 +381,66 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
 
     private void setWatermark() {
         if (eventSource.getXsOut() == null) {
+            LOGGER.debug("Skipping watermark update - XStream connection is null");
             return;
         }
         try {
             final PositionAndScn message = eventSource.receivePublishedPosition();
             if (message == null) {
+                LOGGER.trace("No pending watermark update");
                 return;
             }
-            LOGGER.debug("Recording offsets to Oracle");
+
+            long currentTimeMillis = System.currentTimeMillis();
+            LOGGER.info("WATERMARK UPDATE: Applying committed offset to Oracle XStream at {}",
+                       java.time.Instant.ofEpochMilli(currentTimeMillis));
+
             if (message.position != null) {
-                if (LOGGER.isDebugEnabled()) {
-                    LOGGER.debug("Recording position {}", message.position);
-                }
+                // Log the SCN/timestamp we're about to commit
+                LOGGER.info("WATERMARK: Setting processed low watermark with LCR position: {} (SCN from position: {})",
+                           message.position, message.position.getScn());
+
+                long startTime = System.currentTimeMillis();
                 eventSource.getXsOut().setProcessedLowWatermark(
                         message.position.getRawPosition(),
                         XStreamOut.DEFAULT_MODE);
+                long duration = System.currentTimeMillis() - startTime;
+
+                // Calculate how old this event is
+                java.time.Instant positionTimestamp = message.position.getTimestamp();
+                if (positionTimestamp != null) {
+                    long ageSeconds = (currentTimeMillis - positionTimestamp.toEpochMilli()) / 1000;
+                    if (ageSeconds > 180) {
+                        LOGGER.warn("WATERMARK LAG WARNING: Set watermark for event from {} - that's {} seconds ({} min) old! This will update LAST_SENT_MESSAGE_CREATE_TIME to an old timestamp.",
+                                   positionTimestamp, ageSeconds, ageSeconds / 60);
+                    } else {
+                        LOGGER.info("WATERMARK: Successfully set position watermark (took {}ms) - Event age: {} seconds - V$XSTREAM_OUTBOUND_SERVER.LAST_SENT_MESSAGE_CREATE_TIME will be set to: {}",
+                                   duration, ageSeconds, positionTimestamp);
+                    }
+                } else {
+                    LOGGER.info("WATERMARK: Successfully set position watermark (took {}ms) - V$XSTREAM_OUTBOUND_SERVER.LAST_SENT_MESSAGE_CREATE_TIME should now be updated",
+                               duration);
+                }
             }
             else if (message.scn != null) {
-                if (LOGGER.isDebugEnabled()) {
-                    LOGGER.debug("Recording position with SCN {}", message.scn);
-                }
+                LOGGER.info("WATERMARK: Setting processed low watermark with SCN bytes");
+                long startTime = System.currentTimeMillis();
                 eventSource.getXsOut().setProcessedLowWatermark(
                         message.scn,
                         XStreamOut.DEFAULT_MODE);
+                long duration = System.currentTimeMillis() - startTime;
+                LOGGER.info("WATERMARK: Successfully set SCN watermark (took {}ms) - V$XSTREAM_OUTBOUND_SERVER.LAST_SENT_MESSAGE_CREATE_TIME should now be updated",
+                           duration);
             }
             else {
-                LOGGER.warn("Nothing in offsets could be recorded to Oracle");
+                LOGGER.warn("WATERMARK: Cannot update - both position and SCN are null in offset message");
                 return;
             }
-            LOGGER.trace("Offsets recorded to Oracle");
         }
         catch (StreamsException e) {
-            LOGGER.error("Error while processing offsets to Oracle: {}", e.getMessage());
+            LOGGER.error("CRITICAL: Failed to set processed low watermark in Oracle XStream", e);
+            LOGGER.error("Oracle StreamsException details - Error code: {}, SQL state: {}, Message: {}",
+                        e.getErrorCode(), e.getSQLState(), e.getMessage());
             throw new DebeziumException("Couldn't set processed low watermark", e);
         }
     }
