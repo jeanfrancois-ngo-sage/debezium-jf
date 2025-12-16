@@ -406,21 +406,8 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
                         XStreamOut.DEFAULT_MODE);
                 long duration = System.currentTimeMillis() - startTime;
 
-                // Calculate how old this event is
-                java.time.Instant positionTimestamp = message.position.getTimestamp();
-                if (positionTimestamp != null) {
-                    long ageSeconds = (currentTimeMillis - positionTimestamp.toEpochMilli()) / 1000;
-                    if (ageSeconds > 180) {
-                        LOGGER.warn("WATERMARK LAG WARNING: Set watermark for event from {} - that's {} seconds ({} min) old! This will update LAST_SENT_MESSAGE_CREATE_TIME to an old timestamp.",
-                                   positionTimestamp, ageSeconds, ageSeconds / 60);
-                    } else {
-                        LOGGER.info("WATERMARK: Successfully set position watermark (took {}ms) - Event age: {} seconds - V$XSTREAM_OUTBOUND_SERVER.LAST_SENT_MESSAGE_CREATE_TIME will be set to: {}",
-                                   duration, ageSeconds, positionTimestamp);
-                    }
-                } else {
-                    LOGGER.info("WATERMARK: Successfully set position watermark (took {}ms) - V$XSTREAM_OUTBOUND_SERVER.LAST_SENT_MESSAGE_CREATE_TIME should now be updated",
-                               duration);
-                }
+                LOGGER.info("WATERMARK: Successfully set position watermark (took {}ms) - V$XSTREAM_OUTBOUND_SERVER.LAST_SENT_MESSAGE_CREATE_TIME should now be updated",
+                           duration);
             }
             else if (message.scn != null) {
                 LOGGER.info("WATERMARK: Setting processed low watermark with SCN bytes");
@@ -439,8 +426,8 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
         }
         catch (StreamsException e) {
             LOGGER.error("CRITICAL: Failed to set processed low watermark in Oracle XStream", e);
-            LOGGER.error("Oracle StreamsException details - Error code: {}, SQL state: {}, Message: {}",
-                        e.getErrorCode(), e.getSQLState(), e.getMessage());
+            LOGGER.error("Oracle StreamsException details - Error code: {}, Message: {}",
+                        e.getErrorCode(), e.getMessage());
             throw new DebeziumException("Couldn't set processed low watermark", e);
         }
     }
