@@ -242,7 +242,7 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
         long enqueueStartTime = System.currentTimeMillis();
         try {
             this.lock.lock();
-
+            LOGGER.info("Lock ACQUIRED - queue: {}/{}, bytes: {}/{}", queue.size(), maxQueueSize, currentQueueSizeInBytes, maxQueueSizeInBytes);
             while (queue.size() >= maxQueueSize || (maxQueueSizeInBytes > 0 && currentQueueSizeInBytes >= maxQueueSizeInBytes)) {
                 waitCycles++;
                 if (waitCycles == 1) {
@@ -298,7 +298,7 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
         LoggingContext.PreviousContext previousContext = loggingContextSupplier.get();
 
         try {
-            LOGGER.debug("polling records...");
+            // LOGGER.debug("polling records...");
             long startTime = System.currentTimeMillis();
             final Timer timeout = Threads.timer(Clock.SYSTEM, Temporals.min(pollInterval, ConfigurationDefaults.RETURN_CONTROL_INTERVAL));
             try {
@@ -310,7 +310,7 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
                         && !timeout.expired()) {
                     throwProducerExceptionIfPresent();
 
-                    LOGGER.debug("no records available or batch size not reached yet, sleeping a bit...");
+                    // LOGGER.debug("no records available or batch size not reached yet, sleeping a bit...");
                     long remainingTimeoutMills = timeout.remaining().toMillis();
                     if (remainingTimeoutMills > 0) {
                         // signal doEnqueue() to add more records
@@ -318,7 +318,7 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
                         // no records available or batch size not reached yet, so wait a bit
                         this.isFull.await(remainingTimeoutMills, TimeUnit.MILLISECONDS);
                     }
-                    LOGGER.debug("checking for more records...");
+                    // LOGGER.debug("checking for more records...");
                 }
                 // signal doEnqueue() to add more records
                 this.isNotFull.signalAll();
