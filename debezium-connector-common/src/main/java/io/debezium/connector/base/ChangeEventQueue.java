@@ -238,14 +238,29 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
             LOGGER.trace("Enqueuing source record '{}'", maybeRedactSensitiveData(record));
         }
 
+        int waitCycles = 0;
+        long enqueueStartTime = System.currentTimeMillis();
         try {
             this.lock.lock();
 
             while (queue.size() >= maxQueueSize || (maxQueueSizeInBytes > 0 && currentQueueSizeInBytes >= maxQueueSizeInBytes)) {
+                waitCycles++;
+                if (waitCycles == 1) {
+                    LOGGER.warn("Queue FULL - Producer blocking (queue: {}/{}, bytes: {}/{})", queue.size(), maxQueueSize, currentQueueSizeInBytes, maxQueueSizeInBytes);
+                }
+                else if (waitCycles % 20 == 0) {
+                    long blockedDuration = System.currentTimeMillis() - enqueueStartTime;
+                    LOGGER.warn("Producer blocked {} cycles ({}ms) - Consumer too slow! Queue: {}/{}", waitCycles, blockedDuration, queue.size(), maxQueueSize);
+                }
                 // signal poll() to drain queue
                 this.isFull.signalAll();
                 // queue size or queue sizeInBytes threshold reached, so wait a bit
                 this.isNotFull.await(pollInterval.toMillis(), TimeUnit.MILLISECONDS);
+            }
+
+            if (waitCycles > 0) {
+                long totalWaitTime = System.currentTimeMillis() - enqueueStartTime;
+                LOGGER.info("Producer UNBLOCKED - waited {} cycles ({}ms), queue now: {}/{}", waitCycles, totalWaitTime, queue.size(), maxQueueSize);
             }
 
             queue.enqueue(record);
@@ -264,6 +279,10 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
         }
         finally {
             this.lock.unlock();
+            long totalDuration = System.currentTimeMillis() - enqueueStartTime;
+            if (waitCycles > 0 || totalDuration > 100) {
+                LOGGER.info("Enqueue completed in {}ms ({} wait cycles) - queue: {}/{}", totalDuration, waitCycles, queue.size(), maxQueueSize);
+            }
         }
     }
 
@@ -280,6 +299,7 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
 
         try {
             LOGGER.debug("polling records...");
+            long startTime = System.currentTimeMillis();
             final Timer timeout = Threads.timer(Clock.SYSTEM, Temporals.min(pollInterval, ConfigurationDefaults.RETURN_CONTROL_INTERVAL));
             try {
                 this.lock.lock();
@@ -302,6 +322,10 @@ public class ChangeEventQueue<T extends Sizeable> implements ChangeEventQueueMet
                 }
                 // signal doEnqueue() to add more records
                 this.isNotFull.signalAll();
+                if (!records.isEmpty()) {
+                    long duration = System.currentTimeMillis() - startTime;
+                    LOGGER.debug("Poll returned {} records in {}ms", records.size(), duration);
+                }
                 return records;
             }
             finally {

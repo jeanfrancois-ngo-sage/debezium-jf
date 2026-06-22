@@ -110,19 +110,51 @@ public class XstreamStreamingChangeEventSource implements StreamingChangeEventSo
 
         try (OracleConnection xsConnection = connectAndAttachWithRetries(jdbcConnection.config(), getStartPosition(offsetContext))) {
             try {
+                int lcrCount = 0;
+                int totalLcrCount = 0;
+                Scn lastScn = effectiveOffset != null ? effectiveOffset.getScn() : null;
+                long loopIterations = 0;
+
+                LOGGER.info("Starting XStream event loop - initial SCN: {}, serverName: {}", lastScn, xstreamOutboundServerName);
                 // 2. receive events while running
                 while (context.isRunning()) {
-                    LOGGER.trace("Receiving LCR");
+                    loopIterations++;
+                    final long receiveStart = System.currentTimeMillis();
+
                     xsOut.receiveLCRCallback(eventHandler, XStreamOut.DEFAULT_MODE);
                     dispatcher.dispatchHeartbeatEvent(partition, offsetContext);
 
+                    final long receiveDuration = System.currentTimeMillis() - receiveStart;
+
+                    // Check if processLCR was actually called (LCR was delivered)
+                    final boolean lcrWasDelivered = eventHandler.checkAndResetLcrProcessedFlag();
                     if (context.isPaused()) {
                         LOGGER.info("Streaming will now pause");
                         context.streamingPaused();
                         context.waitSnapshotCompletion();
                         LOGGER.info("Streaming resumed");
                     }
+
+                    final Scn currentScn = effectiveOffset != null ? effectiveOffset.getScn() : null;
+                    if (currentScn != null && (!currentScn.equals(lastScn))) {
+                        LOGGER.debug("SCN transition: {} -> {} | LCRs for prev SCN: {}", lastScn, currentScn, lcrCount);
+                        lcrCount = 0;
+                        lastScn = currentScn;
+                    }
+
+                    if (lcrWasDelivered) {
+                        lcrCount++;
+                        totalLcrCount++;
+                    }
+                    else {
+                        LOGGER.debug("receiveLCRCallback returned without LCR data (iteration: {}, duration: {} ms)", loopIterations, receiveDuration);
+                    }
+
+                    if (receiveDuration > 1000) {
+                        LOGGER.warn("SLOW CALLBACK: receiveLCRCallback took {} ms (iteration: {}, total LCRs: {})", receiveDuration, loopIterations, totalLcrCount);
+                    }
                 }
+                LOGGER.info("XStream event loop stopped - total LCRs processed: {}, total iterations: {}", totalLcrCount, loopIterations);
             }
             finally {
                 // 3. disconnect
@@ -130,7 +162,9 @@ public class XstreamStreamingChangeEventSource implements StreamingChangeEventSo
                     try {
                         XStreamOut xsOut = this.xsOut;
                         this.xsOut = null;
+                        LOGGER.info("Attempting to detach from XStream outbound server {}", xstreamOutboundServerName);
                         xsOut.detach(XStreamOut.DEFAULT_MODE);
+                        LOGGER.info("Successfully detached from XStream outbound server {}", xstreamOutboundServerName);
                     }
                     catch (StreamsException e) {
                         LOGGER.error("Couldn't detach from XStream outbound server " + xstreamOutboundServerName, e);
@@ -145,13 +179,39 @@ public class XstreamStreamingChangeEventSource implements StreamingChangeEventSo
 
     @Override
     public void commitOffset(Map<String, ?> partition, Map<String, ?> offset) {
-        if (xsOut != null) {
-            LOGGER.debug("Sending message to request recording of offsets to Oracle");
+        try {
+            if (xsOut == null) {
+                LOGGER.warn("Cannot commit offset to Oracle - XStream connection is null (disconnected?)");
+                return;
+            }
+
+            LOGGER.debug("Processing offset commit request from Kafka Connect: partition={}, offset keys={}", partition, offset.keySet());
             final LcrPosition lcrPosition = LcrPosition.valueOf((String) offset.get(SourceInfo.LCR_POSITION_KEY));
             final Scn scn = OracleOffsetContext.getScnFromOffsetMapByKey(offset, SourceInfo.SCN_KEY);
+            // Calculate SCN age to detect lag
+            final Scn currentScn = effectiveOffset != null ? effectiveOffset.getScn() : null;
+            if (currentScn != null && scn != null) {
+                final long scnDiff = currentScn.longValue() - scn.longValue();
+                if (scnDiff > 10000) {
+                    LOGGER.warn("OFFSET LAG WARNING: Committing SCN {} but current processing SCN is {} (diff: {} SCNs behind)",
+                            scn, currentScn, scnDiff);
+                }
+                else {
+                    LOGGER.debug("Committing offset - LCR position={}, SCN={} (current SCN: {}, diff: {})",
+                            lcrPosition, scn, currentScn, scnDiff);
+                }
+            }
+            else {
+                LOGGER.debug("Committing offset - LCR position={}, SCN={}", lcrPosition, scn);
+            }
             // We can safely overwrite the message even if it was not processed. The watermarked will be set to the highest
             // (last) delivered value in a single step instead of incrementally
             sendPublishedPosition(lcrPosition, scn);
+            LOGGER.debug("Offset position sent to message box (will be applied to Oracle during next LCR processing cycle)");
+        }
+        catch (Exception e) {
+            LOGGER.error("CRITICAL: Failed to process offset commit to XStream", e);
+            throw new DebeziumException("Failed to commit offset to XStream", e);
         }
     }
 

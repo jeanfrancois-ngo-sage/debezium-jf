@@ -62,6 +62,9 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
     private final XStreamStreamingChangeEventSourceMetrics streamingMetrics;
     private final Map<String, ChunkColumnValues> columnChunks;
     private RowLCR currentRow;
+    private final Map<String, Long> processLcrInvocationCountPerTable = new HashMap<>(); // Track how many times processLCR is called per table
+    private volatile boolean lcrWasProcessedInLastCallback = false; // Track if LCR was actually received
+    private static final int MAX_TABLE_TRACKING_SIZE = 1000; // Maximum number of tables to track invocation count
 
     LcrEventHandler(OracleConnectorConfig connectorConfig, ErrorHandler errorHandler,
                     EventDispatcher<OraclePartition, TableId> dispatcher, Clock clock,
@@ -83,7 +86,28 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
 
     @Override
     public void processLCR(LCR lcr) throws StreamsException {
+        lcrWasProcessedInLastCallback = true;
+
+        final TableId tableId = getTableId(lcr);
+
+        final String tableKey = tableId.toString();
+        if (processLcrInvocationCountPerTable.size() < MAX_TABLE_TRACKING_SIZE || processLcrInvocationCountPerTable.containsKey(tableKey)) {
+            processLcrInvocationCountPerTable.compute(tableKey, (k, v) -> (v == null) ? 1L : v + 1L);
+        }
+        else {
+            LOGGER.warn("Table tracking limit ({}) reached, not tracking invocation count for table: {}", MAX_TABLE_TRACKING_SIZE, tableId);
+        }
+
+        final boolean isFiltered = !connectorConfig.getTableFilters().dataCollectionFilter().isIncluded(tableId);
+
+        if (isFiltered) {
+            columnChunks.clear();
+            currentRow = null;
+            LOGGER.debug("Skipping LCR for excluded table: {}", tableId);
+            return;
+        }
         LOGGER.trace("Received LCR {}", lcr);
+        LOGGER.trace("Processing LCR from SCN {}", offsetContext.getScn());
         try {
             // First set watermark to flush messages seen
             setWatermark();
@@ -94,14 +118,12 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
             // After a restart it may happen we get the event with the last processed LCR again
             LcrPosition offsetLcrPosition = LcrPosition.valueOf(offsetContext.getLcrPosition());
             if (lcrPosition.compareTo(offsetLcrPosition) <= 0) {
-                if (LOGGER.isDebugEnabled()) {
-                    final LcrPosition recPosition = offsetLcrPosition;
-                    LOGGER.debug("Ignoring change event with already processed SCN/LCR Position {}/{}, last recorded {}/{}",
-                            lcrPosition,
-                            lcrPosition.getScn(),
-                            recPosition != null ? recPosition : "none",
-                            recPosition != null ? recPosition.getScn() : "none");
-                }
+                final LcrPosition recPosition = offsetLcrPosition;
+                LOGGER.debug("Ignoring change event with already processed SCN/LCR Position {}/{}, last recorded {}/{}",
+                        lcrPosition,
+                        lcrPosition.getScn(),
+                        recPosition != null ? recPosition : "none",
+                        recPosition != null ? recPosition.getScn() : "none");
                 return;
             }
 
@@ -114,11 +136,16 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
             offsetContext.tableEvent(new TableId(lcr.getSourceDatabaseName(), lcr.getObjectOwner(), lcr.getObjectName()),
                     lcr.getSourceTime().timestampValue().toInstant());
 
+            final long processingStart = System.currentTimeMillis();
             if (lcr instanceof RowLCR) {
                 processRowLCR((RowLCR) lcr);
             }
             else if (lcr instanceof DDLLCR) {
                 dispatchSchemaChangeEvent((DDLLCR) lcr);
+            }
+            final long processingDuration = System.currentTimeMillis() - processingStart;
+            if (processingDuration > 500) {
+                LOGGER.warn("LCR processing (dispatch) took {} ms - SCN: {}, table: {}.{}", processingDuration, offsetContext.getScn(), lcr.getObjectOwner(), lcr.getObjectName());
             }
         }
         // nothing to be done here if interrupted; the event loop will be stopped in the streaming source
@@ -155,12 +182,11 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
         LOGGER.debug("Processing DML event {}", lcr);
 
         if (RowLCR.COMMIT.equals(lcr.getCommandType())) {
-            final Instant commitTimestamp = lcr.getSourceTime().timestampValue().toInstant();
-            dispatcher.dispatchTransactionCommittedEvent(partition, offsetContext, commitTimestamp);
+            dispatcher.dispatchTransactionCommittedEvent(partition, offsetContext, lcr.getSourceTime().timestampValue().toInstant());
             return;
         }
 
-        TableId tableId = getTableId(lcr);
+        final TableId tableId = getTableId(lcr);
 
         Table table = schema.tableFor(tableId);
         if (table == null) {
@@ -325,43 +351,50 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
 
     private void setWatermark() {
         if (eventSource.getXsOut() == null) {
+            LOGGER.debug("Skipping watermark update - XStream connection is null");
             return;
         }
         try {
             final PositionAndScn message = eventSource.receivePublishedPosition();
             if (message == null) {
+                LOGGER.trace("No pending watermark update");
                 return;
             }
             LOGGER.debug("Recording offsets to Oracle");
             if (message.position != null) {
-                if (LOGGER.isDebugEnabled()) {
-                    LOGGER.debug("Recording position {}", message.position);
-                }
+                final long startTime = System.currentTimeMillis();
                 eventSource.getXsOut().setProcessedLowWatermark(
                         message.position.getRawPosition(),
                         XStreamOut.DEFAULT_MODE);
+                LOGGER.debug("WATERMARK: Set position watermark (took {}ms)", System.currentTimeMillis() - startTime);
             }
             else if (message.scn != null) {
-                if (LOGGER.isDebugEnabled()) {
-                    LOGGER.debug("Recording position with SCN {}", message.scn);
-                }
+                final long startTime = System.currentTimeMillis();
                 eventSource.getXsOut().setProcessedLowWatermark(
                         message.scn,
                         XStreamOut.DEFAULT_MODE);
+                LOGGER.debug("WATERMARK: Set SCN watermark (took {}ms)", System.currentTimeMillis() - startTime);
             }
             else {
-                LOGGER.warn("Nothing in offsets could be recorded to Oracle");
+                LOGGER.warn("WATERMARK: Cannot update - both position and SCN are null in offset message");
                 return;
             }
             LOGGER.trace("Offsets recorded to Oracle");
         }
         catch (StreamsException e) {
+            LOGGER.error("Failed to set processed low watermark in Oracle XStream - error code: {}, message: {}", e.getErrorCode(), e.getMessage(), e);
             throw new DebeziumException("Couldn't set processed low watermark", e);
         }
     }
 
     @Override
     public void processChunk(ChunkColumnValue chunk) throws StreamsException {
+        // If currentRow is null, it means the LCR was filtered out (excluded table)
+        // Skip processing chunks for excluded tables
+        if (currentRow == null) {
+            LOGGER.debug("Skipping chunk for excluded table (currentRow is null)");
+            return;
+        }
         columnChunks.computeIfAbsent(chunk.getColumnName(), v -> new ChunkColumnValues()).add(chunk);
         if (chunk.isEndOfRow()) {
             resolveAndDispatchCurrentChunkedRow();
@@ -425,5 +458,15 @@ class LcrEventHandler implements XStreamLCRCallbackHandler {
         catch (SQLException e) {
             throw new DebeziumException("Failed to process chunk data", e);
         }
+    }
+
+    /**
+     * Check if an LCR was processed in the last receiveLCRCallback invocation and reset the flag.
+     * @return true if processLCR was called, false otherwise
+     */
+    boolean checkAndResetLcrProcessedFlag() {
+        boolean wasProcessed = lcrWasProcessedInLastCallback;
+        lcrWasProcessedInLastCallback = false;
+        return wasProcessed;
     }
 }

@@ -276,6 +276,7 @@ public class EventDispatcher<P extends Partition, T extends DataCollectionId> im
      * @return {@code true} if an event was dispatched (i.e. sent to the message broker), {@code false} otherwise.
      */
     public boolean dispatchDataChangeEvent(P partition, T dataCollectionId, ChangeRecordEmitter<P> changeRecordEmitter) throws InterruptedException {
+        long start = System.currentTimeMillis();
         try {
             boolean handled = false;
             if (changeRecordEmitter.ignoreRecord() || !filter.isIncluded(dataCollectionId)) {
@@ -346,6 +347,10 @@ public class EventDispatcher<P extends Partition, T extends DataCollectionId> im
         catch (Exception e) {
             handleEventProcessingFailure(e, changeRecordEmitter.getOffset());
             return false;
+        }
+        finally {
+            long duration = System.currentTimeMillis() - start;
+            LOGGER.debug("[EventDispatcher] Data change event dispatched in {} ms", duration);
         }
     }
 

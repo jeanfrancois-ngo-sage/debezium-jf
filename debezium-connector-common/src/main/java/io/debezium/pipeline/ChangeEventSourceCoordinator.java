@@ -364,11 +364,25 @@ public class ChangeEventSourceCoordinator<P extends Partition, O extends OffsetC
 
     public void commitOffset(Map<String, ?> partition, Map<String, ?> offset) {
         try {
-            if (!commitOffsetLock.isLocked() && streamingSource != null && offset != null) {
-                streamingSource.commitOffset(partition, offset);
+            if (commitOffsetLock.isLocked()) {
+                LOGGER.warn("Offset commit skipped - lock is held (concurrent operation in progress)");
+                return;
             }
+            if (streamingSource == null) {
+                LOGGER.warn("Offset commit skipped - streaming source is null");
+                return;
+            }
+            if (offset == null) {
+                LOGGER.warn("Offset commit skipped - offset is null");
+                return;
+            }
+
+            LOGGER.debug("Requesting offset commit to streaming source: partition={}, offset keys={}", partition, offset.keySet());
+            streamingSource.commitOffset(partition, offset);
+            LOGGER.debug("Offset commit request completed successfully");
         }
         catch (Throwable e) {
+            LOGGER.error("CRITICAL: Offset commit failed with exception", e);
             errorHandler.setProducerThrowable(e);
         }
     }
